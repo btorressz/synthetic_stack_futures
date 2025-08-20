@@ -16,6 +16,8 @@ Synthetic Stack Futures is a Solana program (built with the Anchor framework) th
 - **NAV** (Net Asset Value) is posted by an oracle; all settlement and PnL are in the quote SPL token (e.g., USDC).
 - **Cash Settlement**: No synthetic or underlying assets are minted or held; all settlement occurs in the quote token.
 - **Liquidation**: If margin falls below required levels, a third-party liquidator can trigger forced settlement and receive a bounty.
+- **Governance**: Admin updates require a two-step, timelocked process with optional N-of-M multisig approval.
+ - **Risk Controls**: Built-in leverage caps, NAV sanity checks, maintenance buffer, partial liquidation, and a socialized loss guard.
 
 ---
 
