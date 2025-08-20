@@ -4,7 +4,7 @@ use anchor_spl::{
     token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer},
 };
 
-declare_id!("prograid");
+declare_id!("programid");
 
 /// PROGRAM OVERVIEW
 /// - Market: defines parameters (margins, fees, oracle auth, price scale) and stores last NAV.
