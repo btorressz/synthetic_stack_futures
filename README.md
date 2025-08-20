@@ -42,3 +42,13 @@ Synthetic Stack Futures is a Solana program (built with the Anchor framework) th
    - `liquidate`: Third party can forcibly close if either side falls below maintenance margin, earning a bounty.
 
 ---
+
+
+## 💡 Key Concepts
+
+- **Margin**: Both parties must deposit initial margin; if it drops below maintenance margin, liquidation is possible.
+- **Fee Vault**: Market collects open fees on each deal, sent to a special vault.
+- **Cash Settlement**: All trades settle in the quote SPL token (no synthetic tokens).
+- **NAV Oracle**: A trusted authority posts NAV, driving PnL and settlement.
+
+---
