@@ -6,19 +6,17 @@ use anchor_spl::{
 
 declare_id!("programid");
 
-/// PROGRAM OVERVIEW
-/// - Market: defines parameters (margins, fees, oracle auth, price scale) and stores last NAV.
-/// - Deal: bilateral futures position (long vs short), no underlying ever minted/held.
-/// - NAV is posted by the oracle authority; all PnL is computed in quote mint (e.g., USDC).
-/// - On open: both sides deposit initial margin; open fees are collected to fee_vault.
-/// - On close: cash settlement using latest NAV; vaults pay out principal +/- PnL.
-/// - Liquidation: allowed when either side falls below maintenance margin; liquidator gets bounty.
-///
-/// Fixed-point:
-///   UNIT_DECIMALS = 6 (stack units), price_decimals set by market, quote_decimals from mint.
+/// Synthetic Stack Futures (cash-settled)
+/// PoC features:
+/// - Market admin + simple multisig + timelock
+/// - Oracle NAV with freshness + jump-limit + optional confidence gate
+/// - Bilateral deal with margin, fees, liquidation, partial liquidation to IM
+/// - Leverage caps (at open and as a liquidation trigger)
+/// - Socialized loss floor: pause on vault depletion (PoC safeguard)
 
-pub const UNIT_DECIMALS: u8 = 6; // "stack units" precision, e.g., 1e6
+pub const UNIT_DECIMALS: u8 = 6; // size units precision (1e6)
 pub const VERSION_SEED: &[u8] = b"v1";
+pub const MAX_ADMINS: usize = 5;
 
 #[program]
 pub mod synthetic_stack_futures {
@@ -34,21 +32,38 @@ pub mod synthetic_stack_futures {
         params: MarketInitParams,
     ) -> Result<()> {
         let market = &mut ctx.accounts.market;
+
         market.authority = ctx.accounts.authority.key();
         market.quote_mint = ctx.accounts.quote_mint.key();
         market.oracle_authority = params.oracle_authority;
         market.stack_id = stack_id;
+
         market.price_decimals = params.price_decimals;
         market.quote_decimals = ctx.accounts.quote_mint.decimals;
+
         market.initial_margin_bps = params.initial_margin_bps;
         market.maintenance_margin_bps = params.maintenance_margin_bps;
         market.fee_bps = params.fee_bps;
         market.liquidator_bps = params.liquidator_bps;
         market.price_stale_seconds = params.price_stale_seconds;
+
+        // New risk/admin fields
+        market.max_leverage_bps = params.max_leverage_bps;
+        market.max_nav_jump_bps = params.max_nav_jump_bps;
+        market.max_confidence_bps = params.max_confidence_bps.unwrap_or(0);
+        market.mm_buffer_bps = params.mm_buffer_bps.unwrap_or(100); // 1% default
+        market.circuit_breaker_until = 0;
+
+        // Multisig defaults (PoC: authority is admin[0], threshold = 1 or provided)
+        market.admin_threshold = params.admin_threshold.unwrap_or(1);
+        market.admins = [Pubkey::default(); MAX_ADMINS];
+        market.admins[0] = market.authority;
+
         market.last_nav = 0;
         market.last_ts = 0;
         market.paused = false;
-        market.bump = ctx.bumps.market; // Anchor >=0.29
+        market.bump = ctx.bumps.market;
+        market.pending = None;
 
         let mva = &mut ctx.accounts.market_vault_auth;
         mva.market = market.key();
@@ -70,38 +85,87 @@ pub mod synthetic_stack_futures {
     }
 
     pub fn pause_market(ctx: Context<AdminMarketToggle>, paused: bool) -> Result<()> {
-        require_keys_eq!(ctx.accounts.market.authority, ctx.accounts.authority.key(), ErrorCode::Unauthorized);
+        // FIX: avoid lifetime coupling by passing key + remaining infos
+        require_admin_or_multisig(&ctx.accounts.market, ctx.accounts.authority.key(), &ctx.remaining_accounts)?;
         ctx.accounts.market.paused = paused;
         Ok(())
     }
 
     pub fn update_market_params(ctx: Context<AdminMarketParams>, params: MarketUpdateParams) -> Result<()> {
-        require_keys_eq!(ctx.accounts.market.authority, ctx.accounts.authority.key(), ErrorCode::Unauthorized);
-        let m = &mut ctx.accounts.market;
-        if let Some(im) = params.initial_margin_bps { m.initial_margin_bps = im; }
-        if let Some(mm) = params.maintenance_margin_bps { m.maintenance_margin_bps = mm; }
-        if let Some(fee) = params.fee_bps { m.fee_bps = fee; }
-        if let Some(liq) = params.liquidator_bps { m.liquidator_bps = liq; }
-        if let Some(ps) = params.price_stale_seconds { m.price_stale_seconds = ps; }
-        if let Some(oa) = params.oracle_authority { m.oracle_authority = oa; }
+        require_admin_or_multisig(&ctx.accounts.market, ctx.accounts.authority.key(), &ctx.remaining_accounts)?;
+        apply_market_updates(&mut ctx.accounts.market, &params);
         Ok(())
     }
 
-    // Oracle posts NAV (scaled by market.price_decimals)
-    pub fn post_nav(ctx: Context<PostNav>, nav: u64) -> Result<()> {
+    /// Propose market params (timelocked)
+    pub fn propose_market_params(
+        ctx: Context<AdminMarketParams>,
+        params: MarketUpdateParams,
+        delay_secs: i64,
+    ) -> Result<()> {
+        require_admin_or_multisig(&ctx.accounts.market, ctx.accounts.authority.key(), &ctx.remaining_accounts)?;
+        let now = Clock::get()?.unix_timestamp;
+        ctx.accounts.market.pending = Some(PendingParams { params, eta: now + delay_secs });
+        Ok(())
+    }
+
+    /// Execute pending market params after ETA
+    pub fn execute_market_params(ctx: Context<AdminMarketParams>) -> Result<()> {
+        require_admin_or_multisig(&ctx.accounts.market, ctx.accounts.authority.key(), &ctx.remaining_accounts)?;
+        let now = Clock::get()?.unix_timestamp;
+        let Some(p) = ctx.accounts.market.pending.clone() else { return err!(ErrorCode::NoPendingParams); };
+        require!(now >= p.eta, ErrorCode::TimelockNotExpired);
+        apply_market_updates(&mut ctx.accounts.market, &p.params);
+        ctx.accounts.market.pending = None;
+        Ok(())
+    }
+
+    /// Rotate authority (multisig or authority)
+    pub fn rotate_authority(ctx: Context<AdminMarketParams>, new_authority: Pubkey) -> Result<()> {
+        require_admin_or_multisig(&ctx.accounts.market, ctx.accounts.authority.key(), &ctx.remaining_accounts)?;
+        ctx.accounts.market.authority = new_authority;
+        // PoC: also update admins[0] to keep UX simple
+        ctx.accounts.market.admins[0] = new_authority;
+        Ok(())
+    }
+
+    // Oracle posts NAV (scaled by market.price_decimals). Optional confidence gate.
+    pub fn post_nav(ctx: Context<PostNav>, nav: u64, nav_confidence: Option<u64>) -> Result<()> {
         let market = &mut ctx.accounts.market;
         require!(!market.paused, ErrorCode::MarketPaused);
         require_keys_eq!(market.oracle_authority, ctx.accounts.oracle_authority.key(), ErrorCode::Unauthorized);
 
+        // Circuit breaker window check
+        let now = Clock::get()?.unix_timestamp;
+        if now < market.circuit_breaker_until {
+            return err!(ErrorCode::CircuitBreaker);
+        }
+
+        // Confidence (if configured and provided)
+        if market.max_confidence_bps > 0 {
+            if let Some(conf) = nav_confidence {
+                let conf_bps = ratio_bps_u128(conf as u128, (nav as u128).max(1))? as u16;
+                require!(conf_bps <= market.max_confidence_bps, ErrorCode::OracleConfidenceTooWide);
+            }
+        }
+
+        // Jump limit check
+        if market.last_nav != 0 {
+            let old = market.last_nav as u128;
+            let newv = nav as u128;
+            let diff = if newv > old { newv - old } else { old - newv };
+            let jump_bps = ratio_bps_u128(diff, old.max(1))? as u16;
+            if jump_bps > market.max_nav_jump_bps {
+                // Trip circuit breaker for a short cool-off (PoC: 5 minutes)
+                market.circuit_breaker_until = now + 300;
+                return err!(ErrorCode::PriceJumpTooLarge);
+            }
+        }
+
         market.last_nav = nav;
-        market.last_ts = Clock::get()?.unix_timestamp;
+        market.last_ts = now;
 
-        emit!(NavPosted {
-            market: market.key(),
-            nav,
-            ts: market.last_ts,
-        });
-
+        emit!(NavPosted { market: market.key(), nav, ts: market.last_ts });
         Ok(())
     }
 
@@ -112,7 +176,7 @@ pub mod synthetic_stack_futures {
     /// Open a bilateral futures deal.
     /// - size: stack units scaled by 1e6 (UNIT_DECIMALS)
     /// - client_order_id: disambiguates multiple deals between same parties
-    /// - long_deposit / short_deposit: quote-mint amounts to move into margin vaults (must >= required + fees)
+    /// - long_deposit / short_deposit: quote-mint amounts to move into margin vaults
     pub fn open_deal(
         ctx: Context<OpenDeal>,
         client_order_id: u64,
@@ -136,6 +200,14 @@ pub mod synthetic_stack_futures {
 
         require!(long_deposit as u128 >= im_required_each + open_fee_each, ErrorCode::InsufficientMargin);
         require!(short_deposit as u128 >= im_required_each + open_fee_each, ErrorCode::InsufficientMargin);
+
+        // Leverage cap at open: based on total effective margin after fees
+        let effective_total_margin = (long_deposit as u128)
+            .saturating_add(short_deposit as u128)
+            .saturating_sub(open_fee_total);
+        require!(effective_total_margin > 0, ErrorCode::InsufficientMargin);
+        let lev_bps = ratio_bps_u128(notional_q, effective_total_margin)? as u16;
+        require!(lev_bps <= market.max_leverage_bps, ErrorCode::LeverageTooHigh);
 
         // Init deal PDA
         let deal = &mut ctx.accounts.deal;
@@ -173,13 +245,8 @@ pub mod synthetic_stack_futures {
         )?;
 
         // Collect open fees from vaults to market fee_vault (authority = deal_vault_auth PDA)
-        let deal_key = deal.key(); // avoid temporary in seeds
-        let seeds: [&[u8]; 4] = [
-            VERSION_SEED,
-            b"deal_vault_auth",
-            deal_key.as_ref(),
-            &[dva.bump],
-        ];
+        let deal_key = deal.key();
+        let seeds: [&[u8]; 4] = [VERSION_SEED, b"deal_vault_auth", deal_key.as_ref(), &[dva.bump]];
         transfer_signed(
             &ctx.accounts.token_program,
             &ctx.accounts.long_margin_vault,
@@ -208,7 +275,7 @@ pub mod synthetic_stack_futures {
             short: deal.short,
             size,
             entry_nav,
-            notional_quote: notional_q as u64, // typical fits in u64 for tests
+            notional_quote: notional_q as u64,
             long_deposit,
             short_deposit,
             open_fee_each: open_fee_each as u64,
@@ -248,7 +315,6 @@ pub mod synthetic_stack_futures {
     }
 
     /// Close the deal at current NAV; pays both sides and closes vaults.
-    /// Either party may call this; all funds settle to the provided payout ATAs.
     pub fn close_deal(ctx: Context<CloseDeal>) -> Result<()> {
         let market = &ctx.accounts.market;
         let deal = &mut ctx.accounts.deal;
@@ -321,52 +387,46 @@ pub mod synthetic_stack_futures {
         Ok(())
     }
 
-    /// Liquidate if either side below maintenance margin at current NAV.
-    /// Liquidator receives bounty from the pool before payouts.
+    /// Liquidate if maintenance breached OR leverage > cap; pays bounty then settle like close.
     pub fn liquidate(ctx: Context<Liquidate>) -> Result<()> {
-        let market = &ctx.accounts.market;
-        let deal = &mut ctx.accounts.deal;
-        require!(deal.is_open, ErrorCode::NotOpen);
-        require!(!market.paused, ErrorCode::MarketPaused);
-        ensure_price_fresh(market)?;
+        let m = &mut ctx.accounts.market;
+        let d = &mut ctx.accounts.deal;
+        require!(d.is_open, ErrorCode::NotOpen);
+        require!(!m.paused, ErrorCode::MarketPaused);
+        ensure_price_fresh(m)?;
 
-        let notional_q = notional_quote(deal.size, market.last_nav, market.price_decimals, market.quote_decimals)?;
-        let mm_required = bps(notional_q, market.maintenance_margin_bps)?;
+        let notional_q = notional_quote(d.size, m.last_nav, m.price_decimals, m.quote_decimals)?;
+        let mm_required = bps(notional_q, m.maintenance_margin_bps.saturating_add(m.mm_buffer_bps))?;
 
-        // Compute equity for each side
-        let pnl_long = pnl_quote(
-            deal.size,
-            deal.entry_nav,
-            market.last_nav,
-            market.price_decimals,
-            market.quote_decimals,
-        )?;
-        let long_equity = (ctx.accounts.long_margin_vault.amount as i128) + pnl_long;
-        let short_equity = (ctx.accounts.short_margin_vault.amount as i128) - pnl_long;
+        // PnL & equity
+        let pnl_long = pnl_quote(d.size, d.entry_nav, m.last_nav, m.price_decimals, m.quote_decimals)?;
+        let long_eq = (ctx.accounts.long_margin_vault.amount as i128) + pnl_long;
+        let short_eq = (ctx.accounts.short_margin_vault.amount as i128) - pnl_long;
 
-        // Must be liquidatable (either side below maintenance)
+        let pool = (ctx.accounts.long_margin_vault.amount as u128)
+            .saturating_add(ctx.accounts.short_margin_vault.amount as u128);
+        let lev_bps = if pool > 0 { ratio_bps_u128(notional_q, pool)? as u16 } else { u16::MAX };
+        let over_lev = lev_bps > m.max_leverage_bps;
+
+        // Liquidatable if either equity < MM or over leverage
         require!(
-            long_equity < mm_required as i128 || short_equity < mm_required as i128,
+            long_eq < mm_required as i128 || short_eq < mm_required as i128 || over_lev,
             ErrorCode::NotLiquidatable
         );
 
-        // Pool & bounty
-        let total_pool = (ctx.accounts.long_margin_vault.amount as u128)
-            + (ctx.accounts.short_margin_vault.amount as u128);
-        let bounty = bps(total_pool, market.liquidator_bps)? as u64;
-
+        // Bounty from pool
+        let bounty = bps(pool, m.liquidator_bps)? as u64;
         if bounty > 0 {
-            // Pay bounty from LONG vault first, then SHORT
+            // pay from long first then short
             let mut remaining = bounty;
-            let long_bal = ctx.accounts.long_margin_vault.amount;
-            let take_long = remaining.min(long_bal);
+            let take_long = remaining.min(ctx.accounts.long_margin_vault.amount);
             if take_long > 0 {
                 drain_to(
                     &ctx.accounts.token_program,
                     &ctx.accounts.long_margin_vault,
                     &ctx.accounts.liquidator_ata,
                     &ctx.accounts.deal_vault_auth,
-                    &deal,
+                    &d,
                     take_long,
                 )?;
                 remaining -= take_long;
@@ -377,20 +437,20 @@ pub mod synthetic_stack_futures {
                     &ctx.accounts.short_margin_vault,
                     &ctx.accounts.liquidator_ata,
                     &ctx.accounts.deal_vault_auth,
-                    &deal,
+                    &d,
                     remaining,
                 )?;
             }
         }
 
-        // Recompute remaining pool and do close-like payout
+        // Recompute pool after bounty
         let long_amt = ctx.accounts.long_margin_vault.amount as u128;
         let short_amt = ctx.accounts.short_margin_vault.amount as u128;
-        let pool = long_amt + short_amt;
+        let new_pool = long_amt + short_amt;
 
         let desired_long = (long_amt as i128) + pnl_long;
-        let long_payout = clamp_i128(desired_long, 0, pool as i128) as u128;
-        let short_payout = pool.saturating_sub(long_payout);
+        let long_payout = clamp_i128(desired_long, 0, new_pool as i128) as u128;
+        let short_payout = new_pool.saturating_sub(long_payout);
 
         if long_payout > 0 {
             drain_to(
@@ -398,7 +458,7 @@ pub mod synthetic_stack_futures {
                 &ctx.accounts.long_margin_vault,
                 &ctx.accounts.long_payout_ata,
                 &ctx.accounts.deal_vault_auth,
-                &deal,
+                &d,
                 long_payout as u64,
             )?;
         }
@@ -408,10 +468,13 @@ pub mod synthetic_stack_futures {
                 &ctx.accounts.short_margin_vault,
                 &ctx.accounts.short_payout_ata,
                 &ctx.accounts.deal_vault_auth,
-                &deal,
+                &d,
                 short_payout as u64,
             )?;
         }
+
+        // Check depletion before closing
+        let depleted = ctx.accounts.long_margin_vault.amount == 0 || ctx.accounts.short_margin_vault.amount == 0;
 
         // Close vaults
         close_signed_token_account(
@@ -419,24 +482,85 @@ pub mod synthetic_stack_futures {
             &ctx.accounts.long_margin_vault,
             &ctx.accounts.market_authority,
             &ctx.accounts.deal_vault_auth,
-            &deal,
+            &d,
         )?;
         close_signed_token_account(
             &ctx.accounts.token_program,
             &ctx.accounts.short_margin_vault,
             &ctx.accounts.market_authority,
             &ctx.accounts.deal_vault_auth,
-            &deal,
+            &d,
         )?;
 
-        deal.is_open = false;
+        d.is_open = false;
 
-        emit!(DealLiquidated {
-            deal: deal.key(),
-            market: deal.market,
-            bounty_paid: bounty,
-            close_nav: market.last_nav,
-        });
+        // Socialized loss floor (PoC): if a vault depleted during liquidation, pause market
+        if depleted {
+            m.paused = true;
+        }
+
+        emit!(DealLiquidated { deal: d.key(), market: d.market, bounty_paid: bounty, close_nav: m.last_nav });
+        Ok(())
+    }
+
+    /// Partial liquidation: move just enough to bring the under-margined side back to **initial** margin.
+    /// Rewards liquidator with bounty on the skimmed amount. Keeps deal open if successful.
+    pub fn liquidate_to_im(ctx: Context<PartialLiquidate>, max_bounty_take: u64) -> Result<()> {
+        let m = &mut ctx.accounts.market;
+        let d = &mut ctx.accounts.deal;
+        require!(d.is_open, ErrorCode::NotOpen);
+        require!(!m.paused, ErrorCode::MarketPaused);
+        ensure_price_fresh(m)?;
+
+        let notional_q = notional_quote(d.size, m.last_nav, m.price_decimals, m.quote_decimals)?;
+        let im_required = bps(notional_q, m.initial_margin_bps)? as i128;
+
+        let pnl_long = pnl_quote(d.size, d.entry_nav, m.last_nav, m.price_decimals, m.quote_decimals)?;
+        let long_eq = (ctx.accounts.long_margin_vault.amount as i128) + pnl_long;
+        let short_eq = (ctx.accounts.short_margin_vault.amount as i128) - pnl_long;
+
+        // Who's under IM?
+        let (under_is_long, deficit) = if long_eq < im_required {
+            (true, (im_required - long_eq) as u64)
+        } else if short_eq < im_required {
+            (false, (im_required - short_eq) as u64)
+        } else {
+            return err!(ErrorCode::NotLiquidatable);
+        };
+
+        // Compute bounty and capped take
+        let bounty = bps(deficit as u128, m.liquidator_bps)? as u64;
+        let take_total = deficit.saturating_add(bounty).min(max_bounty_take);
+
+        if under_is_long {
+            // from short → liquidator (bounty) and → long (deficit)
+            let deficit_take = take_total.saturating_sub(bounty);
+            if bounty > 0 {
+                drain_to(&ctx.accounts.token_program, &ctx.accounts.short_margin_vault, &ctx.accounts.liquidator_ata, &ctx.accounts.deal_vault_auth, &d, bounty)?;
+            }
+            if deficit_take > 0 {
+                drain_to(&ctx.accounts.token_program, &ctx.accounts.short_margin_vault, &ctx.accounts.long_margin_vault, &ctx.accounts.deal_vault_auth, &d, deficit_take)?;
+            }
+        } else {
+            let deficit_take = take_total.saturating_sub(bounty);
+            if bounty > 0 {
+                drain_to(&ctx.accounts.token_program, &ctx.accounts.long_margin_vault, &ctx.accounts.liquidator_ata, &ctx.accounts.deal_vault_auth, &d, bounty)?;
+            }
+            if deficit_take > 0 {
+                drain_to(&ctx.accounts.token_program, &ctx.accounts.long_margin_vault, &ctx.accounts.short_margin_vault, &ctx.accounts.deal_vault_auth, &d, deficit_take)?;
+            }
+        }
+
+        // Refresh cached balances
+        d.long_margin = ctx.accounts.long_margin_vault.amount;
+        d.short_margin = ctx.accounts.short_margin_vault.amount;
+
+        // If still under IM after attempt, pause (PoC socialized loss guard)
+        let long_eq2 = (d.long_margin as i128) + pnl_long;
+        let short_eq2 = (d.short_margin as i128) - pnl_long;
+        if long_eq2 < im_required || short_eq2 < im_required {
+            m.paused = true;
+        }
 
         Ok(())
     }
@@ -453,31 +577,100 @@ pub struct Market {
     pub oracle_authority: Pubkey,
     pub stack_id: Pubkey,
 
-    pub price_decimals: u8, // e.g., 6
-    pub quote_decimals: u8, // from mint
+    pub price_decimals: u8,
+    pub quote_decimals: u8,
 
     pub initial_margin_bps: u16,
     pub maintenance_margin_bps: u16,
     pub fee_bps: u16,
     pub liquidator_bps: u16,
-
     pub price_stale_seconds: u32,
 
-    pub last_nav: u64, // scaled by price_decimals
+    pub last_nav: u64,
     pub last_ts: i64,
 
     pub paused: bool,
     pub bump: u8,
+
+    // New risk/admin
+    pub max_leverage_bps: u16,
+    pub max_nav_jump_bps: u16,
+    pub max_confidence_bps: u16, // 0 = disabled
+    pub circuit_breaker_until: i64,
+    pub mm_buffer_bps: u16,
+
+    pub admin_threshold: u8,
+    pub admins: [Pubkey; MAX_ADMINS],
+
+    pub pending: Option<PendingParams>,
 }
 
 impl Market {
-    pub const LEN: usize = 8  // disc
-        + 32 + 32 + 32 + 32
-        + 1 + 1
-        + 2 + 2 + 2 + 2
-        + 4
-        + 8 + 8
-        + 1 + 1;
+    pub const LEN: usize =
+        8 + // disc
+        32*4 + // keys
+        1 + 1 + // decimals
+        2*4 + // bps fields (im, mm, fee, liq)
+        4 + // stale secs
+        8 + 8 + // last_nav, last_ts
+        1 + 1 + // paused, bump
+        2 + 2 + 2 + 8 + 2 + // max_lev, max_jump, max_conf, breaker_until, mm_buffer
+        1 + // admin_threshold
+        (32*MAX_ADMINS) + // admins
+        1 + PendingParams::MAX_LEN; // Option tag + pending (max)
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct PendingParams {
+    pub params: MarketUpdateParams,
+    pub eta: i64,
+}
+impl PendingParams {
+    // rough upper bound for serialization (borsh)
+    pub const MAX_LEN: usize = MarketUpdateParams::MAX_LEN + 8;
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
+pub struct MarketUpdateParams {
+    pub oracle_authority: Option<Pubkey>,
+    pub initial_margin_bps: Option<u16>,
+    pub maintenance_margin_bps: Option<u16>,
+    pub fee_bps: Option<u16>,
+    pub liquidator_bps: Option<u16>,
+    pub price_stale_seconds: Option<u32>,
+
+    // new params
+    pub max_leverage_bps: Option<u16>,
+    pub max_nav_jump_bps: Option<u16>,
+    pub max_confidence_bps: Option<u16>,
+    pub mm_buffer_bps: Option<u16>,
+    pub admin_threshold: Option<u8>,
+}
+impl MarketUpdateParams {
+    pub const MAX_LEN: usize =
+        (1+32) + // oracle_authority
+        (1+2)*4 + // four u16 options (im, mm, fee, liq)
+        (1+4) + // price_stale_seconds
+        (1+2)*4 + // new u16 options
+        (1+1); // admin_threshold
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct MarketInitParams {
+    pub oracle_authority: Pubkey,
+    pub price_decimals: u8,
+    pub initial_margin_bps: u16,
+    pub maintenance_margin_bps: u16,
+    pub fee_bps: u16,
+    pub liquidator_bps: u16,
+    pub price_stale_seconds: u32,
+
+    // new
+    pub max_leverage_bps: u16,
+    pub max_nav_jump_bps: u16,
+    pub max_confidence_bps: Option<u16>,
+    pub mm_buffer_bps: Option<u16>,
+    pub admin_threshold: Option<u8>,
 }
 
 #[account]
@@ -495,8 +688,8 @@ pub struct Deal {
     pub long: Pubkey,
     pub short: Pubkey,
 
-    pub size: u64,       // units scaled by 1e6
-    pub entry_nav: u64,  // scaled by price_decimals
+    pub size: u64,
+    pub entry_nav: u64,
     pub is_open: bool,
 
     pub long_margin: u64,
@@ -506,11 +699,7 @@ pub struct Deal {
     pub bump: u8,
 }
 impl Deal {
-    pub const LEN: usize = 8  // disc
-        + 32 + 32 + 32
-        + 8 + 8 + 1
-        + 8 + 8
-        + 8 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 1;
 }
 
 #[account]
@@ -526,30 +715,9 @@ impl DealVaultAuth {
 // Instruction Contexts
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct MarketInitParams {
-    pub oracle_authority: Pubkey,
-    pub price_decimals: u8,       // e.g., 6
-    pub initial_margin_bps: u16,  // e.g., 1000 (=10%)
-    pub maintenance_margin_bps: u16, // e.g., 500 (=5%)
-    pub fee_bps: u16,             // open fee (total; split half each)
-    pub liquidator_bps: u16,      // bounty from pool
-    pub price_stale_seconds: u32, // e.g., 300
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
-pub struct MarketUpdateParams {
-    pub oracle_authority: Option<Pubkey>,
-    pub initial_margin_bps: Option<u16>,
-    pub maintenance_margin_bps: Option<u16>,
-    pub fee_bps: Option<u16>,
-    pub liquidator_bps: Option<u16>,
-    pub price_stale_seconds: Option<u32>,
-}
-
 #[derive(Accounts)]
 #[instruction(stack_id: Pubkey)]
-pub struct InitMarket <'info> {
+pub struct InitMarket<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
@@ -638,7 +806,7 @@ pub struct OpenDeal<'info> {
     // deal state
     #[account(
         init,
-        payer = long, // long pays rent; arbitrary
+        payer = long,
         space = Deal::LEN,
         seeds = [VERSION_SEED, b"deal", market.key().as_ref(), long.key().as_ref(), short.key().as_ref(), &client_order_id.to_le_bytes()],
         bump
@@ -743,7 +911,6 @@ pub struct AddMarginShort<'info> {
 
 #[derive(Accounts)]
 pub struct CloseDeal<'info> {
-    // either party can close (kept both signers for symmetry with tests)
     #[account(mut)]
     pub long: Signer<'info>,
     #[account(mut)]
@@ -776,7 +943,6 @@ pub struct CloseDeal<'info> {
     #[account(mut, constraint = short_payout_ata.mint == quote_mint.key(), constraint = short_payout_ata.owner == short.key())]
     pub short_payout_ata: Account<'info, TokenAccount>,
 
-    // for closing token accounts rent refund
     /// CHECK: only used as destination for close_account rent
     #[account(mut, address = market.authority)]
     pub market_authority: UncheckedAccount<'info>,
@@ -812,6 +978,46 @@ pub struct Liquidate<'info> {
     pub short_margin_vault: Account<'info, TokenAccount>,
 
     // payouts
+    #[account(mut, constraint = long_payout_ata.mint == quote_mint.key(), constraint = long_payout_ata.owner == deal.long)]
+    pub long_payout_ata: Account<'info, TokenAccount>,
+    #[account(mut, constraint = short_payout_ata.mint == quote_mint.key(), constraint = short_payout_ata.owner == deal.short)]
+    pub short_payout_ata: Account<'info, TokenAccount>,
+    #[account(mut, constraint = liquidator_ata.mint == quote_mint.key(), constraint = liquidator_ata.owner == liquidator.key())]
+    pub liquidator_ata: Account<'info, TokenAccount>,
+
+    /// CHECK: only used as destination for close_account rent
+    #[account(mut, address = market.authority)]
+    pub market_authority: UncheckedAccount<'info>,
+
+    pub deal_vault_auth: Account<'info, DealVaultAuth>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct PartialLiquidate<'info> {
+    #[account(mut)]
+    pub liquidator: Signer<'info>,
+
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+    #[account(mut, has_one = market)]
+    pub deal: Account<'info, Deal>,
+
+    pub quote_mint: Box<Account<'info, Mint>>,
+
+    #[account(
+        mut,
+        constraint = long_margin_vault.mint == quote_mint.key(),
+        constraint = long_margin_vault.owner == deal_vault_auth.key()
+    )]
+    pub long_margin_vault: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = short_margin_vault.mint == quote_mint.key(),
+        constraint = short_margin_vault.owner == deal_vault_auth.key()
+    )]
+    pub short_margin_vault: Account<'info, TokenAccount>,
+
     #[account(mut, constraint = long_payout_ata.mint == quote_mint.key(), constraint = long_payout_ata.owner == deal.long)]
     pub long_payout_ata: Account<'info, TokenAccount>,
     #[account(mut, constraint = short_payout_ata.mint == quote_mint.key(), constraint = short_payout_ata.owner == deal.short)]
@@ -883,15 +1089,33 @@ pub struct DealLiquidated {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-/* Helpers (lifetime-safe CPI wrappers) */
+// Helpers & Admin Utilities
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn ensure_price_fresh(market: &Market) -> Result<()> {
+fn apply_market_updates(m: &mut Market, p: &MarketUpdateParams) {
+    if let Some(x) = p.oracle_authority       { m.oracle_authority = x; }
+    if let Some(x) = p.initial_margin_bps     { m.initial_margin_bps = x; }
+    if let Some(x) = p.maintenance_margin_bps { m.maintenance_margin_bps = x; }
+    if let Some(x) = p.fee_bps                { m.fee_bps = x; }
+    if let Some(x) = p.liquidator_bps         { m.liquidator_bps = x; }
+    if let Some(x) = p.price_stale_seconds    { m.price_stale_seconds = x; }
+
+    if let Some(x) = p.max_leverage_bps       { m.max_leverage_bps = x; }
+    if let Some(x) = p.max_nav_jump_bps       { m.max_nav_jump_bps = x; }
+    if let Some(x) = p.max_confidence_bps     { m.max_confidence_bps = x; }
+    if let Some(x) = p.mm_buffer_bps          { m.mm_buffer_bps = x; }
+    if let Some(x) = p.admin_threshold        { m.admin_threshold = x; }
+}
+
+fn ensure_price_fresh(m: &Market) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
-    require!(market.last_nav > 0, ErrorCode::PriceNotSet);
-    let age = now.saturating_sub(market.last_ts);
+    if now < m.circuit_breaker_until {
+        return err!(ErrorCode::CircuitBreaker);
+    }
+    require!(m.last_nav > 0, ErrorCode::PriceNotSet);
+    let age = now.saturating_sub(m.last_ts);
     require!(age >= 0, ErrorCode::ClockWentBackwards);
-    require!((age as u64) <= market.price_stale_seconds as u64, ErrorCode::PriceStale);
+    require!((age as u64) <= m.price_stale_seconds as u64, ErrorCode::PriceStale);
     Ok(())
 }
 
@@ -899,6 +1123,12 @@ fn bps(amount: u128, bps: u16) -> Result<u128> {
     amount
         .checked_mul(bps as u128)
         .and_then(|x| x.checked_div(10_000))
+        .ok_or(ErrorCode::MathOverflow.into())
+}
+
+fn ratio_bps_u128(num: u128, denom: u128) -> Result<u128> {
+    num.checked_mul(10_000)
+        .and_then(|x| x.checked_div(denom))
         .ok_or(ErrorCode::MathOverflow.into())
 }
 
@@ -954,7 +1184,7 @@ fn clamp_i128(x: i128, lo: i128, hi: i128) -> i128 {
     if x < lo { lo } else if x > hi { hi } else { x }
 }
 
-// Lifetime-unified helper CPIs
+// CPI helpers (lifetime-safe)
 
 fn transfer_from_user<'info>(
     token_program: &Program<'info, Token>,
@@ -978,11 +1208,10 @@ fn transfer_signed<'info>(
     token_program: &Program<'info, Token>,
     from: &Account<'info, TokenAccount>,
     to: &Account<'info, TokenAccount>,
-    pda_auth: AccountInfo<'info>, // pass by value to avoid ref temporaries
+    pda_auth: AccountInfo<'info>,
     signer_seeds: &[&[u8]],
     amount: u64,
 ) -> Result<()> {
-    // Avoid temporary: wrap signer_seeds in a binding that lives through the CPI call
     let signer_groups = [signer_seeds];
     let cpi = CpiContext::new_with_signer(
         token_program.to_account_info(),
@@ -999,7 +1228,7 @@ fn transfer_signed<'info>(
 fn drain_to<'info>(
     token_program: &Program<'info, Token>,
     from_vault: &Account<'info, TokenAccount>,
-    to_ata: &Account<'info, TokenAccount>,
+    to_account: &Account<'info, TokenAccount>,
     deal_vault_auth: &Account<'info, DealVaultAuth>,
     deal: &Account<'info, Deal>,
     amount: u64,
@@ -1007,17 +1236,12 @@ fn drain_to<'info>(
     if amount == 0 {
         return Ok(());
     }
-    let deal_key = deal.key(); // avoid temp borrow in seeds
-    let seeds: [&[u8]; 4] = [
-        VERSION_SEED,
-        b"deal_vault_auth",
-        deal_key.as_ref(),
-        &[deal_vault_auth.bump],
-    ];
+    let deal_key = deal.key();
+    let seeds: [&[u8]; 4] = [VERSION_SEED, b"deal_vault_auth", deal_key.as_ref(), &[deal_vault_auth.bump]];
     transfer_signed(
         token_program,
         from_vault,
-        to_ata,
+        to_account,
         deal_vault_auth.to_account_info(),
         &seeds[..],
         amount,
@@ -1034,13 +1258,8 @@ fn close_signed_token_account<'info>(
     if token_acc.amount != 0 {
         return Ok(()); // only close when empty
     }
-    let deal_key = deal.key(); // avoid temp borrow in seeds
-    let seeds: [&[u8]; 4] = [
-        VERSION_SEED,
-        b"deal_vault_auth",
-        deal_key.as_ref(),
-        &[deal_vault_auth.bump],
-    ];
+    let deal_key = deal.key();
+    let seeds: [&[u8]; 4] = [VERSION_SEED, b"deal_vault_auth", deal_key.as_ref(), &[deal_vault_auth.bump]];
     let signer_groups = [&seeds[..]];
     let cpi = CpiContext::new_with_signer(
         token_program.to_account_info(),
@@ -1052,6 +1271,34 @@ fn close_signed_token_account<'info>(
         &signer_groups,
     );
     token::close_account(cpi)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+/* Admin Multisig Helpers (lifetime-decoupled) */
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn require_admin_or_multisig<'a>(
+    m: &Market,
+    authority_key: Pubkey,
+    remaining: &[AccountInfo<'a>],
+) -> Result<()> {
+    if authority_key == m.authority {
+        return Ok(());
+    }
+    require_multisig(m, remaining)
+}
+
+fn require_multisig<'a>(m: &Market, infos: &[AccountInfo<'a>]) -> Result<()> {
+    let mut hits: u8 = 0;
+    for ai in infos {
+        if !ai.is_signer { continue; }
+        let k = ai.key();
+        if m.admins.iter().any(|a| *a != Pubkey::default() && *a == k) {
+            hits = hits.saturating_add(1);
+        }
+    }
+    require!((hits as u8) >= m.admin_threshold, ErrorCode::NotEnoughSigners);
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1082,4 +1329,21 @@ pub enum ErrorCode {
     AlreadyOpen,
     #[msg("Not liquidatable at current NAV")]
     NotLiquidatable,
+
+    // New error codes
+    #[msg("Requested leverage exceeds limit")]
+    LeverageTooHigh,
+    #[msg("Oracle confidence too wide")]
+    OracleConfidenceTooWide,
+    #[msg("NAV jump too large; circuit breaker tripped")]
+    PriceJumpTooLarge,
+    #[msg("Circuit breaker active")]
+    CircuitBreaker,
+    #[msg("No pending params")]
+    NoPendingParams,
+    #[msg("Timelock not expired")]
+    TimelockNotExpired,
+    #[msg("Not enough admin signers")]
+    NotEnoughSigners,
 }
+
