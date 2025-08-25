@@ -220,6 +220,31 @@ The test file validates the **Synthetic Stack Futures** program.
 
 ---
 
+### 🛠️ Helper Function
+- **`createInitializeMintIx(mintPubkey, decimals, mintAuthority, freezeAuthority)`**  
+  - Creates the raw Token Program `InitializeMint` instruction.  
+  - Used to initialize the mint without relying on SPL libraries.  
+
+---
+
+### ✅ Assertions
+- After **`initMarket`**:  
+  - `authority` equals `wallet`.  
+  - `quoteMint` equals `mintKp`.  
+  - `priceDecimals` equals 6.  
+  - `quoteDecimals` equals 6.  
+
+- After **`postNav`**:  
+  - `lastNav` in `marketAcc` equals the posted `nav`.  
+
+- After **`pauseMarket`**:  
+  - The `paused` flag is set to `true`.  
+
+- After **`pauseMarket(false)`**:  
+  - The `paused` flag is set back to `false`.  
+
+---
+
 
 ## 📄 License
 
