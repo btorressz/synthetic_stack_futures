@@ -245,6 +245,19 @@ The test file validates the **Synthetic Stack Futures** program.
 
 ---
 
+### ⚠️ Common Pitfalls
+- **Program not deployed / mismatched ID** – Ensure `declare_id!()` in `lib.rs` matches the deployed ID and use **Build & Deploy** before tests.  
+- **Fee Vault ATA mismatch** – Always compute `feeVaultAta` deterministically from seeds.  
+- **Uninitialized mint** – The mint must be created and initialized before passing into `initMarket`.  
+
+---
+
+### ➕ Possible Extensions
+- **Deal opening**: Mint quote tokens to long/short ATAs and call `open_deal`.  
+- **Liquidations**: Manipulate NAV to trigger maintenance breach and call `liquidate`.  
+- **Governance flow**: Stage and execute parameter updates through the timelock + multisig system.  
+
+---
 
 ## 📄 License
 
