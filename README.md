@@ -4,7 +4,7 @@
 
 Synthetic Stack Futures is a Solana program (built with the Anchor framework) that enables **cash-settled, bilateral synthetic futures** using SPL tokens. Market parameters, margin requirements, and NAV settlement are all managed on-chain. The protocol is designed for transparency, flexibility, and direct P2P (long vs short) trading with no underlying asset ever minted or held.
 
-**NOTE**: This project is a Proof of concept
+**NOTE**: This project is a Proof of concept 
 
 
 ---
@@ -182,6 +182,41 @@ The test file validates the **Synthetic Stack Futures** program.
 6. **Verify market state** by fetching `marketAcc`.  
 7. **Post NAV** (`nav`) using `postNav`.  
 8. **Pause and unpause** the market using `pauseMarket(true/false)`.  
+
+---
+
+### 📌 Variables & Constants
+- **`wallet`** – The test wallet (`pg.wallet`).  
+- **`TOKEN_PROGRAM_ID`** – Classic SPL Token Program ID.  
+- **`ASSOCIATED_TOKEN_PROGRAM_ID`** – Associated Token Program ID.  
+- **`MINT_SIZE`** – Fixed size of a classic SPL mint account (82 bytes).  
+- **`decimals`** – Number of decimals for the quote token (6).  
+- **`mintKp`** – Keypair for the new mint account.  
+- **`PROGRAM_ID`** – Program ID from `pg.program.programId`.  
+- **`VERSION_SEED`** – PDA seed string (`"v1"`).  
+- **`stackId`** – Random public key identifying the market/stack.  
+- **`marketPda`** – PDA for the `Market` account.  
+- **`mvaPda`** – PDA for the Market Vault Authority.  
+- **`feeVaultAta`** – Associated Token Account for fees (owner = `mvaPda`, mint = `mintKp`).  
+- **`params`** – Object containing market initialization parameters:  
+  - `oracleAuthority`  
+  - `priceDecimals`  
+  - `initialMarginBps`  
+  - `maintenanceMarginBps`  
+  - `feeBps`  
+  - `liquidatorBps`  
+  - `priceStaleSeconds`  
+  - `maxLeverageBps`  
+  - `maxNavJumpBps`  
+  - `maxConfidenceBps`  
+  - `mmBufferBps`  
+  - `adminThreshold`  
+- **`txInit`** – Transaction for `initMarket`.  
+- **`marketAcc`** – Market account fetched after initialization.  
+- **`nav`** – Net Asset Value posted for the test.  
+- **`txNav`** – Transaction for `postNav`.  
+- **`txPause`** – Transaction for pausing the market.  
+- **`txUnpause`** – Transaction for unpausing the market.  
 
 ---
 
