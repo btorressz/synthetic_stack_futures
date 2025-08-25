@@ -169,6 +169,22 @@ Synthetic Stack Futures is a Solana program (built with the Anchor framework) th
 
 The test file validates the **Synthetic Stack Futures** program.
 
+---
+
+### 🔄 Flow of the Test
+1. **Airdrop** SOL to the test wallet (`wallet`) for fees.  
+2. **Create a quote mint** (`mintKp`) with 6 decimals using `createInitializeMintIx`.  
+3. **Derive PDAs**:  
+   - `marketPda` – PDA for the `Market` account.  
+   - `mvaPda` – PDA for the Market Vault Authority.  
+4. **Derive the Fee Vault ATA** (`feeVaultAta`) owned by `mvaPda` for the `mintKp`.  
+5. **Call `initMarket`** with PoC parameters (`params`).  
+6. **Verify market state** by fetching `marketAcc`.  
+7. **Post NAV** (`nav`) using `postNav`.  
+8. **Pause and unpause** the market using `pauseMarket(true/false)`.  
+
+---
+
 
 ## 📄 License
 
