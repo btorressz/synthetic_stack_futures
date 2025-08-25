@@ -4,7 +4,7 @@ use anchor_spl::{
     token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer},
 };
 
-declare_id!("programid");
+declare_id!("FSBdeh58ourJm9Wjf1BFZ8jSGrgbhN2jrF3Vw4BdiQx1");
 
 /// Synthetic Stack Futures (cash-settled)
 /// PoC features:
