@@ -290,3 +290,59 @@ describe("Synthetic Stack Futures – minimal test (no SPL helpers)", () => {
     console.log("🎉 All tests passed - minimal flow OK!");
   });
 });
+
+//Test Output
+/*
+
+  Synthetic Stack Futures – minimal test (no SPL helpers)
+    ✅ Airdrop successful
+    === Creating Quote Mint ===
+    ✅ Quote mint created: 9ws6P59qPwkZuiew3Y6RYN39SygnaM2KPnDT1b5bcbmn
+    === Deriving PDAs ===
+    Market PDA: A9jXHZQeB3t7iHemCGcSPFrjMnv8gBvr52mvzCenGcQn
+    MVA PDA: 3m1ocEaFYFWW1dZLsJKSfG6gPaPZw5XHg29aJtXhs4JJ
+    Fee Vault ATA: 2TvBmwLeWvbbbopU9upSRggMdjfxCwGnKMsmChyL8zcV
+    Stack ID: 5ND8kYvf3sbCVeLAPnB9gd2WSoKLbXkMCfMpfPisAwqs
+    === Account Debugging ===
+    Authority: AqM9yiMxJGdxLsk4kQTde6sNR6i1nF8MRKwzetYiUdR7
+    Quote Mint: 9ws6P59qPwkZuiew3Y6RYN39SygnaM2KPnDT1b5bcbmn
+    Program ID: FSBdeh58ourJm9Wjf1BFZ8jSGrgbhN2jrF3Vw4BdiQx1
+    Authority: EXISTS
+    Quote Mint: EXISTS
+      Owner: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+      Lamports: 1461600
+    System Program: EXISTS
+    Token Program: EXISTS
+    Associated Token Program: EXISTS
+    Rent Sysvar: EXISTS
+    Market PDA exists: false
+    MVA PDA exists: false
+    Fee Vault ATA exists: false
+    =========================
+    === Calling initMarket ===
+    ✅ initMarket transaction confirmed: 2XLgGLDmQKJvg5LwE1rSw9PSMefS3j4BiMsvQGTDv9stCMAJozdejRz44z2X4jEoHWZPPF8rLS2k6nBFcaUHUm9j
+    === Verifying Market Creation ===
+    Market authority: AqM9yiMxJGdxLsk4kQTde6sNR6i1nF8MRKwzetYiUdR7
+    Market quoteMint: 9ws6P59qPwkZuiew3Y6RYN39SygnaM2KPnDT1b5bcbmn
+    Market priceDecimals: 6
+    Market quoteDecimals: 6
+    ✅ Market validation passed
+    === Posting NAV ===
+    NAV posted: 1234567
+    ✅ NAV posting successful
+    === Testing Pause/Unpause ===
+    Market paused: true
+    Market unpaused: true
+    ✅ Pause/Unpause successful
+    🎉 All tests passed - minimal flow OK!
+    ✔ initMarket + postNav + pause toggle (7973ms)
+  1 passing (8s)
+$ 
+
+
+
+
+
+
+
+*/
